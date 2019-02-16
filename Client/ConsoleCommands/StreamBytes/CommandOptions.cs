@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Text;
 using Microsoft.Extensions.CommandLineUtils;
 
-namespace GrpcSandbox.Client.ConsoleCommands.Streaming
+namespace GrpcSandbox.Client.ConsoleCommands.StreamBytes
 {
     public class CommandOptions
     {

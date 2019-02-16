@@ -14,7 +14,7 @@ namespace GrpcSandbox.Client
                 {
                     Name = nameof(Client),
                 }
-                .AddCommand<ConsoleCommands.Streaming.Command>("stream-bytes")
+                .AddCommand<ConsoleCommands.StreamBytes.Command>("stream-bytes")
                 .OnExecuteShowHelp()
                 .Execute(args);
             }

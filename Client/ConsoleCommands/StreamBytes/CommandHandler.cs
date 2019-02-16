@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 using GrpcSandbox.Api.Streaming;
 using Extensions.Threading;
 
-namespace GrpcSandbox.Client.ConsoleCommands.Streaming
+namespace GrpcSandbox.Client.ConsoleCommands.StreamBytes
 {
     public class CommandHandler : IAsyncCommandHandler
     {

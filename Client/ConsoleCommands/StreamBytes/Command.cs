@@ -1,7 +1,7 @@
 ﻿using Microsoft.Extensions.CommandLineUtils;
 using Extensions.CommandLineUtils;
 
-namespace GrpcSandbox.Client.ConsoleCommands.Streaming
+namespace GrpcSandbox.Client.ConsoleCommands.StreamBytes
 {
     public class Command : ICommandConfigurator
     {
