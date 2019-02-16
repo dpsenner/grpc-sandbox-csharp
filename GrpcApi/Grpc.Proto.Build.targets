@@ -1,0 +1,387 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <UsingTask
+      TaskName="GenerateCSharpFromProtoFile"
+      TaskFactory="CodeTaskFactory"
+      AssemblyFile="$(RoslynCodeTaskFactory)"
+      Condition=" '$(RoslynCodeTaskFactory)' != '' ">
+    <ParameterGroup />
+    <Task>
+      <Reference Include="Microsoft.Build.Tasks.Core"/>
+      <Reference Include="System.IO"/>
+      <Code Type="Class" Language="C#">
+        <![CDATA[
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+using ThreadingTask = System.Threading.Tasks.Task;
+
+public class GenerateCSharpFromProtoFile : Task
+{
+	[Required]
+	public string ProjectDir {get; set; }
+
+	[Required]
+	public string PackagePaths { get; set; }
+
+	[Required]
+	public string ProtoSourcePath { get; set; }
+	
+	[Required]
+	public string BaseNamespace { get; set; }
+	
+	[Required]
+	public string ProtoPathsToInclude { get; set; }
+
+	public override bool Execute()
+	{
+		// resolve generated .cs files in project
+		List<string> existingGeneratedFiles = GetFilesFrom(ProjectDir).Where(t => t.EndsWith(".cs")).ToList();
+		foreach (var existingGeneratedFile in existingGeneratedFiles)
+		{
+			File.Delete(existingGeneratedFile);
+		}
+		
+		try
+		{
+			// resolve protoc files
+			string protoSourcePath = Path.Combine(ProjectDir, ProtoSourcePath);
+			List<string> protoPathsToInclude = ProtoPathsToInclude.Split(';').Select(x => Path.Combine(ProjectDir, x)).ToList();
+			
+			List<string> protoFilePaths = GetFilesFrom(protoSourcePath).Where(t => t.EndsWith(".proto")).ToList();
+			if (protoFilePaths.Count == 0)
+			{
+				Log.LogWarning($"Could not find any proto files at path '{protoSourcePath}'");
+				return true;
+			}
+			
+			// process proto files
+			foreach (string protoFilePath in protoFilePaths)
+			{
+				bool found = protoPathsToInclude.Any(x => protoFilePath.StartsWith(x));
+				if (found) 
+				{
+					ProcessProtoFile(protoSourcePath, protoFilePath);
+				}
+			}
+			
+			return true;
+		}
+		catch (Exception ex)
+		{
+			Log.LogErrorFromException(ex);
+			return false;
+		}
+	}
+	
+	private void ProcessProtoFile(string protoSourcePath, string protoFilePath)
+	{
+		ProcessStartInfo protocStartInfo = GetProtocStartInfo(protoSourcePath, protoFilePath);
+		Log.LogMessage(MessageImportance.High, $"{protocStartInfo.FileName} {protocStartInfo.Arguments}");
+		Process p = Process.Start(protocStartInfo);
+		ThreadingTask stdoutTask = ProcessProtocOutputAsync(p.StandardOutput);
+		ThreadingTask stderrTask = ProcessProtocOutputAsync(p.StandardError);
+		p.WaitForExit();
+		ThreadingTask.WaitAll(stdoutTask, stderrTask);
+		if (p.ExitCode != 0)
+		{
+			var protoFileRelativePath = GetRelativePathToProtoFile(protoSourcePath, protoFilePath);
+			throw new InvalidOperationException($"protoc failed to compile {protoFileRelativePath}\n{protocStartInfo.FileName} {protocStartInfo.Arguments}");
+		}
+	}
+	
+	private ProcessStartInfo GetProtocStartInfo(string protoSourcePath, string protoFilePath)
+	{
+		// resolve path to protoc tool
+		string protocPath = GetProtocPath();
+		
+		// resolve protoc-gen-rpc plugin
+		string protocGenRpcPluginPath = GetProtocGenRpcPluginPath();
+		
+		// get protoc arguments
+		string protoFileRelativePath = GetRelativePathToProtoFile(protoSourcePath, protoFilePath);
+		string csharpOutPath = ProjectDir;
+		string grpcOutPath = Path.Combine(ProjectDir, GetRelativeGrpcOutPath(protoFilePath));
+		Directory.CreateDirectory(grpcOutPath);
+		string googleProtobufWellKnownTypesPath = GetGoogleProtobufToolsPath();
+		string protocArguments = $"--proto_path={googleProtobufWellKnownTypesPath};{protoSourcePath} --csharp_out={csharpOutPath} --grpc_out {grpcOutPath} --csharp_opt=file_extension=.cs,base_namespace={BaseNamespace} --plugin=protoc-gen-grpc={protocGenRpcPluginPath} {protoFilePath}";
+		return new ProcessStartInfo()
+		{
+			FileName = protocPath,
+			Arguments = protocArguments,
+			RedirectStandardError = true,
+			RedirectStandardOutput = true,
+			UseShellExecute = false,
+		};
+	}
+	
+	private string GetRelativeGrpcOutPath(string protoFilePath)
+	{
+		// parse proto file and extract csharp namespace
+		// then remove the BaseNameSpace prefix
+		// then transform namespace to a directory path by replacing dots with slash
+		// finally return the result
+		string csharpNamespace = GetCSharpNamespaceFromProtoFile(protoFilePath);
+    if (csharpNamespace.Equals(BaseNamespace)) 
+    {
+      return string.Empty;
+    }
+    
+		string baseNamespacePrefix = $"{BaseNamespace}.";
+		if (!csharpNamespace.StartsWith(baseNamespacePrefix))
+		{
+			throw new InvalidOperationException($"The package name {csharpNamespace} is not prefixed with the base namespace {BaseNamespace}");
+		}
+    
+		csharpNamespace = csharpNamespace.Substring(baseNamespacePrefix.Length);
+		return csharpNamespace.Replace(".", $"{Path.DirectorySeparatorChar}");
+	}
+	
+	private string GetCSharpNamespaceFromProtoFile(string protoFilePath)
+	{
+		foreach (var line in File.ReadLines(protoFilePath))
+		{
+			string prefix = "option csharp_namespace = \"";
+			string suffix = "\";";
+			if (line.StartsWith(prefix) && line.EndsWith(suffix))
+			{
+				return line.Substring(prefix.Length, line.Length - prefix.Length - suffix.Length);
+			}
+		}
+		
+		throw new InvalidOperationException($"Could not csharp name space from proto file: {protoFilePath}");
+	}
+	
+	private string GetRelativePathToProtoFile(string protoSourcePath, string protoFilePath)
+	{
+		var protoFileRelativePath = protoFilePath.Replace(protoSourcePath, "");
+		var directorySeparator = $"{Path.DirectorySeparatorChar}";
+		if (protoFileRelativePath.StartsWith(directorySeparator))
+		{
+			protoFileRelativePath = protoFileRelativePath.Substring(directorySeparator.Length);
+		}
+		return protoFileRelativePath;
+	}
+	
+	private IEnumerable<string> GetFilesFrom(string path)
+	{
+		if (!Directory.Exists(path))
+		{
+			throw new InvalidOperationException($"Path '{path}' does not exist.");
+		}
+		
+		foreach (string filePath in Directory.GetFiles(path))
+		{
+			yield return filePath;
+		}
+		
+		foreach (string directoryPath in Directory.GetDirectories(path))
+		{
+			foreach (string filePath in GetFilesFrom(directoryPath))
+			{
+				yield return filePath;
+			}
+		}
+	}
+	
+	private string GetProtocPath()
+	{
+		// resolve the architecture to determine which kind of protoc binary should be used
+		var arch = (RuntimeInformation.ProcessArchitecture.HasFlag(Architecture.X64) ? "x64" : "x86");
+		string environment = null;
+		string protocExecutableName = null;
+		if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+		{
+			environment = $"macosx_{arch}";
+			protocExecutableName = "protoc";
+		}
+		else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+		{
+			environment = $"linux_{arch}";
+			protocExecutableName = "protoc";
+		}
+		else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		{
+			environment = $"windows_{arch}";
+			protocExecutableName = "protoc.exe";
+		}
+		else
+		{
+			throw new InvalidOperationException($"Unknown os platform!");
+		}
+		
+		// examine package paths
+		string grpcToolsPath = GetPackagePath("grpc.tools");
+		
+		// guess the best match protoc binary
+		string protocPath = Path.Combine(grpcToolsPath, "tools", environment, protocExecutableName);
+		if (!File.Exists(protocPath))
+		{
+			Log.LogWarning($"Grpc Tools Path: {grpcToolsPath}");
+			Log.LogWarning($"arch: {arch}");
+			Log.LogWarning($"environment: {environment}");
+			Log.LogWarning($"protoc executable name: {protocExecutableName}");
+			Log.LogWarning($"protoc path: {protocPath}");
+			throw new InvalidOperationException($"Resolved protoc but the file does not exist; {protocPath}");
+		}
+		
+		return protocPath;
+	}
+	
+	private string GetProtocGenRpcPluginPath()
+	{
+		// resolve: grpc_csharp_plugin.exe
+		var arch = (RuntimeInformation.ProcessArchitecture.HasFlag(Architecture.X64) ? "x64" : "x86");
+		string environment = null;
+		string grpcCSharpPluginExecutableName = null;
+		if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+		{
+			environment = $"macosx_{arch}";
+			grpcCSharpPluginExecutableName = "grpc_csharp_plugin";
+		}
+		else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+		{
+			environment = $"linux_{arch}";
+			grpcCSharpPluginExecutableName = "grpc_csharp_plugin";
+		}
+		else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		{
+			environment = $"windows_{arch}";
+			grpcCSharpPluginExecutableName = "grpc_csharp_plugin.exe";
+		}
+		else
+		{
+			throw new InvalidOperationException($"Unknown os platform!");
+		}
+		
+		// examine package paths
+		string grpcToolsPath = GetPackagePath("grpc.tools");
+		
+		// guess the best match protoc binary
+		string grpcCSharpPluginPath = Path.Combine(grpcToolsPath, "tools", environment, grpcCSharpPluginExecutableName);
+		if (!File.Exists(grpcCSharpPluginPath))
+		{
+			Log.LogWarning($"Grpc Tools Path: {grpcToolsPath}");
+			Log.LogWarning($"arch: {arch}");
+			Log.LogWarning($"environment: {environment}");
+			Log.LogWarning($"grpc csharp plugin executable name: {grpcCSharpPluginExecutableName}");
+			Log.LogWarning($"grpc csharp plugin: {grpcCSharpPluginPath}");
+			throw new InvalidOperationException($"Resolved grpc csharp plugin but the file does not exist; {grpcCSharpPluginPath}");
+		}
+		
+		return grpcCSharpPluginPath;
+	}
+	
+	private string GetGoogleProtobufToolsPath()
+	{
+		string packagePath = GetPackagePath("google.protobuf.tools");
+		string packageToolsPath = Path.Combine(packagePath, "tools");
+		return packageToolsPath;
+	}
+	
+	private string GetPackagePath(string packageName)
+	{
+		string packagePath = PackagePaths.Split(';').FirstOrDefault(item => item.Contains(packageName));
+		if (packagePath == default(string))
+		{
+			throw new InvalidOperationException($"Could not locate {packageName}; the project might be missing a required nuget depencency; PackagePaths = {PackagePaths}");
+		}
+		
+		return packagePath;
+	}
+	
+	private ThreadingTask ProcessProtocOutputAsync(StreamReader stream)
+	{
+		return ThreadingTask.Run(() =>
+		{
+			var noLineWarningPattern = new Regex("^(?<file>[^:]+): warning: (?<message>.*)$", RegexOptions.Compiled);
+			var errorPattern = new Regex("^(?<file>.*)\\((?<line>[0-9]+)\\) : error in column=(?<column>[0-9]+): (?<message>.*)$|^(?<file>.*):(?<line>[0-9]+):(?<column>[0-9]+): (?<message>.*)$|^(?<option>.*): (?<file>.*): (?<message>.*)$", RegexOptions.Compiled);
+			var noLinePattern = new Regex("^(?<file>[^:]+): (?<message>.*)$", RegexOptions.Compiled);
+			var warnPattern = new Regex("^\\[(?<sourcemodule>.*) (?<level>.*) (?<sourcefile>.*):(?<sourceline>[0-9]+)\\] (?<message>.*)", RegexOptions.Compiled);
+			var protoFilePattern = new Regex("proto file: (?<filename>.*\\.proto)", RegexOptions.Compiled);
+			int errors = 0;
+			
+			string line;
+			while (null != (line = stream.ReadLine()))
+			{
+				Match match = null;
+				
+				match = noLineWarningPattern.Match(line);
+				if (match.Success)
+				{
+					string filename = match.Groups["file"].Value;
+					string message = match.Groups["message"].Value;
+					Log.LogWarning("protobuf", null, null, filename, 0, 0, 0, 0, message, messageArgs: new string[0]);
+					continue;
+				}
+
+				match = errorPattern.Match(line);
+				if (match.Success)
+				{
+					string filename = match.Groups["file"].Value;
+					int lineNum = ParseInt(match.Groups["line"].Value, 0);
+					int columnNum = ParseInt(match.Groups["column"].Value, 0);
+					string message = match.Groups["message"].Value;
+					errors++;
+					Log.LogError("protobuf", null, null, filename, lineNum, columnNum, lineNum, columnNum, message, messageArgs: new string[0]);
+					continue;
+				}
+				
+				match = warnPattern.Match(line);
+				if (match.Success)
+				{
+					string message = match.Groups["message"].Value;
+					string filename = protoFilePattern.Match(message).Groups["filename"].Value;
+					if (filename != null)
+					{
+						Log.LogWarning("protobuf", null, null, filename, 0, 0, 0, 0, "{0}", message);
+					}
+					else
+					{
+						Log.LogWarning("{0}", message);
+					}
+					
+					continue;
+				}
+				
+				match = noLinePattern.Match(line);
+				if (match.Success)
+				{
+					string filename = match.Groups["file"].Value;
+					string message = match.Groups["message"].Value;
+					errors++;
+					Log.LogError("protobuf", null, null, filename, 0, 0, 0, 0, message, messageArgs: new string[0]);
+					continue;
+				}
+				
+				Log.LogMessageFromText(line, MessageImportance.High);
+			}
+		});
+	}
+	
+	private int ParseInt(string str, int defaultTo)
+	{
+		if (String.IsNullOrEmpty(str))
+		{
+			return defaultTo;
+		}
+		
+		if (!int.TryParse(str, out int result))
+		{
+			return defaultTo;
+		}
+		
+		return result;
+	}
+}
+]]>
+      </Code>
+    </Task>
+  </UsingTask>
+</Project>

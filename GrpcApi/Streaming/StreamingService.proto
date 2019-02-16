@@ -1,0 +1,20 @@
+﻿syntax = "proto3";
+
+package grpc_sandbox.streaming;
+
+option csharp_namespace = "GrpcSandbox.Api.Streaming";
+
+service StreamingService {
+	rpc StreamBytes(StreamBytesRequest) returns (stream StreamBytesResponse);
+}
+
+message StreamBytesRequest {
+	int64 total_chunks = 1;
+	int32 chunk_size = 2;
+	reserved 3 to max;
+}
+
+message StreamBytesResponse {
+	bytes chunk = 1;
+	reserved 2 to max;
+}
